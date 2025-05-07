@@ -1,0 +1,1723 @@
+// src/App.jsx
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+
+// Firebase imports
+import { auth, db, storage } from './firebaseConfig'; // Importer fra din konfigurasjonsfil
+import {
+  onAuthStateChanged,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  signOut,
+} from 'firebase/auth';
+import {
+  collection,
+  addDoc,
+  doc,
+  setDoc,
+  getDoc,
+  getDocs,
+  query,
+  where,
+  orderBy,
+  onSnapshot,
+  serverTimestamp,
+  updateDoc,
+  deleteDoc,
+  arrayUnion,
+  arrayRemove,
+  Timestamp, // Importer Timestamp
+} from 'firebase/firestore';
+import { ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
+
+// Ikoner
+import { ThumbsUp, MessageSquare, PlusCircle, CalendarDays, Users, Trophy, Sun, Snowflake, Image as ImageIcon, Trash2, UserCircle, Zap, AlertTriangle, Clock, MapPin, UserPlus, Edit3, ArrowLeft, UploadCloud, UserRoundPlus, XCircle, Camera, Video, VideoOff, LogOut, Loader2 } from 'lucide-react';
+
+// --- Hjelpefunksjoner ---
+const formatDate = (timestamp) => {
+  if (!timestamp) return 'Ukjent dato';
+  // Konverter Firebase Timestamp til JavaScript Date-objekt
+  const date = timestamp instanceof Timestamp ? timestamp.toDate() : new Date(timestamp);
+  if (isNaN(date.getTime())) return 'Ugyldig dato'; // Sjekk om datoen er gyldig
+  return date.toLocaleDateString('nb-NO', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  });
+};
+
+const formatTime = (timeString) => {
+    if (!timeString) return '';
+    return timeString;
+}
+
+// --- Konstante verdier ---
+const SWIM_GOAL = 30;
+const availableAvatarColors = ['bg-blue-500', 'bg-green-500', 'bg-pink-500', 'bg-yellow-500', 'bg-purple-500', 'bg-red-500', 'bg-indigo-500', 'bg-teal-500', 'bg-orange-500'];
+const reactionTypes = [
+  { id: 'like', emoji: '👍', label: 'Like' },
+  { id: 'cold', emoji: '🥶', label: 'Iskaldt!' },
+  { id: 'brave', emoji: '💪', label: 'Modig!' },
+  { id: 'fun', emoji: '🎉', label: 'Gøy!' },
+];
+
+// --- Komponenter ---
+
+// ProgressBar (uendret fra forrige versjon)
+const ProgressBar = ({ value, max, showLabel = true, barHeight = "h-2.5", labelSize = "text-sm" }) => {
+  const percentage = Math.max(0, Math.min(100, (value / max) * 100));
+  return (
+    <div className="w-full">
+      {showLabel && (
+        <div className={`flex justify-between mb-1 ${labelSize}`}>
+          <span className="text-gray-600">Fremgang:</span>
+          <span className="text-sky-600 font-medium">{value} / {max} bad</span>
+        </div>
+      )}
+      <div className={`w-full bg-gray-200 rounded-full ${barHeight} dark:bg-gray-700 overflow-hidden`}>
+        <div 
+          className="bg-sky-500 rounded-full transition-all duration-500 ease-out" 
+          style={{ width: `${percentage}%`, height: '100%' }}
+        ></div>
+      </div>
+    </div>
+  );
+};
+
+// Avatar komponent (Oppdatert for å bruke avatarUrl fra Firestore)
+const Avatar = ({ userProfile, sizeClass = "w-10 h-10 text-lg", imageSizeClass = "", extraClasses = "", onClick, title }) => {
+    if (!userProfile) return null; // Bruker nå userProfile-objektet
+    const commonClasses = `rounded-full flex items-center justify-center font-semibold shrink-0 ${extraClasses}`;
+
+    if (userProfile.avatarUrl) { // Sjekker avatarUrl fra Firestore
+        return (
+            <img 
+                src={userProfile.avatarUrl} 
+                alt={`${userProfile.name || 'Bruker'} avatar`} 
+                className={`${commonClasses} ${sizeClass} ${imageSizeClass} object-cover`} 
+                onClick={onClick}
+                title={title}
+            />
+        );
+    }
+    // Fallback til farge og initial
+    const initial = typeof userProfile.name === 'string' && userProfile.name.length > 0 ? userProfile.name.substring(0, 1) : '?';
+    return (
+        <div 
+            className={`${commonClasses} ${sizeClass} ${userProfile.avatarColor || 'bg-gray-400'} text-white`}
+            onClick={onClick}
+            title={title}
+        >
+            {initial}
+        </div>
+    );
+};
+
+// --- Hoved App Komponent ---
+function App() {
+  // Auth state
+  const [authUser, setAuthUser] = useState(null); // Firebase Auth brukerobjekt
+  const [loadingAuth, setLoadingAuth] = useState(true);
+
+  // App data state (hentes fra Firestore)
+  const [userProfiles, setUserProfiles] = useState({}); // Objekt for å holde brukerprofiler { userId: profileData }
+  const [swims, setSwims] = useState([]);
+  const [plannedSwims, setPlannedSwims] = useState([]);
+  const [loadingData, setLoadingData] = useState(true); // Laster data fra Firestore
+
+  // UI state
+  const [currentPage, setCurrentPage] = useState('feed');
+  const [profileUserIdToView, setProfileUserIdToView] = useState(null); 
+  const [showLogSwimModal, setShowLogSwimModal] = useState(false);
+  const [showPlannedSwimModal, setShowPlannedSwimModal] = useState(false);
+  const [showEditProfileModal, setShowEditProfileModal] = useState(false);
+  // Fjerner showCreateProfileModal, bruker Auth for registrering
+
+  // Henter innlogget brukers profil fra userProfiles-objektet
+  const currentUserProfile = useMemo(() => {
+      if (authUser && userProfiles[authUser.uid]) {
+          return { ...userProfiles[authUser.uid], uid: authUser.uid }; // Inkluder uid for enkelhets skyld
+      }
+      return null;
+  }, [authUser, userProfiles]);
+
+  // --- Effekter for Firebase ---
+
+  // Effekt for å lytte til Auth state endringer
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setAuthUser(user);
+      setLoadingAuth(false);
+      if (!user) {
+          // Hvis bruker logger ut, nullstill evt. profilvisning
+          setCurrentPage('feed');
+          setProfileUserIdToView(null);
+      }
+    });
+    return () => unsubscribe(); // Cleanup listener
+  }, []);
+
+  // Effekt for å hente alle brukerprofiler (for å vise navn/avatar overalt)
+  useEffect(() => {
+      const usersRef = collection(db, "users");
+      const unsubscribe = onSnapshot(usersRef, (querySnapshot) => {
+          const profiles = {};
+          querySnapshot.forEach((doc) => {
+              profiles[doc.id] = { id: doc.id, ...doc.data() }; // Bruker doc.id som nøkkel
+          });
+          setUserProfiles(profiles);
+      }, (error) => {
+          console.error("Feil ved henting av brukerprofiler:", error);
+      });
+      return () => unsubscribe(); // Cleanup listener
+  }, []);
+
+
+  // Effekt for å hente swims og plannedSwims fra Firestore
+  useEffect(() => {
+    setLoadingData(true);
+    
+    // Hent Swims
+    const swimsQuery = query(collection(db, "swims"), orderBy("createdAt", "desc"));
+    const unsubscribeSwims = onSnapshot(swimsQuery, (querySnapshot) => {
+      const swimsData = querySnapshot.docs.map(doc => ({ 
+          id: doc.id, 
+          ...doc.data(), 
+          itemType: 'logged' 
+      }));
+      setSwims(swimsData);
+      setLoadingData(false); // Sett loading til false etter første datahenting (kan justeres)
+    }, (error) => {
+        console.error("Feil ved henting av swims:", error);
+        setLoadingData(false);
+    });
+
+    // Hent Planned Swims
+    const plannedSwimsQuery = query(collection(db, "plannedSwims"), orderBy("createdAt", "desc"));
+    const unsubscribePlannedSwims = onSnapshot(plannedSwimsQuery, (querySnapshot) => {
+      const plannedData = querySnapshot.docs.map(doc => ({ 
+          id: doc.id, 
+          ...doc.data(), 
+          itemType: 'planned' 
+      }));
+      setPlannedSwims(plannedData);
+    }, (error) => {
+        console.error("Feil ved henting av planned swims:", error);
+    });
+
+    // Cleanup listeners
+    return () => {
+      unsubscribeSwims();
+      unsubscribePlannedSwims();
+    };
+  }, []); // Tom dependency array, kjører én gang
+
+   // Memoized leaderboard data (basert på data fra userProfiles)
+   const leaderboardData = useMemo(() => {
+    // Konverter userProfiles-objektet til en array og beregn swims
+    const usersArray = Object.values(userProfiles).map(profile => {
+        const userSwims = swims.filter(s => s.userId === profile.id).length;
+        return { ...profile, swims: userSwims };
+    });
+    return usersArray.sort((a, b) => b.swims - a.swims);
+  }, [userProfiles, swims]);
+
+
+  // --- Firebase Funksjoner (eksempler) ---
+
+  // Registrering (brukes i AuthModal)
+  const handleSignUp = async (email, password, name) => {
+    if (!name.trim()) {
+      alert("Navn må fylles ut.");
+      return;
+    }
+    try {
+      const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+      const user = userCredential.user;
+      // Opprett brukerdokument i Firestore
+      await setDoc(doc(db, "users", user.uid), {
+        name: name,
+        email: user.email,
+        avatarUrl: null, // Starter uten profilbilde
+        avatarColor: availableAvatarColors[Math.floor(Math.random() * availableAvatarColors.length)], // Tilfeldig startfarge
+        createdAt: serverTimestamp(),
+      });
+      // Bruker blir automatisk logget inn via onAuthStateChanged
+    } catch (error) {
+      console.error("Feil ved registrering:", error);
+      alert(`Registrering feilet: ${error.message}`);
+    }
+  };
+
+  // Pålogging (brukes i AuthModal)
+  const handleSignIn = async (email, password) => {
+    try {
+      await signInWithEmailAndPassword(auth, email, password);
+      // Bruker blir automatisk satt via onAuthStateChanged
+    } catch (error) {
+      console.error("Feil ved pålogging:", error);
+      alert(`Pålogging feilet: ${error.message}`);
+    }
+  };
+
+  // Utlogging
+  const handleSignOut = async () => {
+    try {
+      await signOut(auth);
+      // State oppdateres via onAuthStateChanged
+    } catch (error) {
+      console.error("Feil ved utlogging:", error);
+    }
+  };
+
+  // Legg til bad (Firestore & Storage)
+  const addSwim = async (swimData) => {
+    if (!authUser) return;
+    const { date, description, location, imageFile } = swimData; // Får imageFile nå
+    let imageUrl = null; // Start med null
+
+    setLoadingData(true); // Vis lasteindikator
+
+    try {
+        // 1. Last opp bilde hvis det finnes
+        if (imageFile) {
+            const imageRef = ref(storage, `swimImages/${authUser.uid}/${Date.now()}_${imageFile.name}`);
+            const snapshot = await uploadBytes(imageRef, imageFile);
+            imageUrl = await getDownloadURL(snapshot.ref);
+        }
+
+        // 2. Legg til dokument i Firestore
+        await addDoc(collection(db, "swims"), {
+            userId: authUser.uid,
+            date: Timestamp.fromDate(new Date(date)), // Konverter til Firestore Timestamp
+            location: location || null,
+            description: description,
+            imageUrl: imageUrl, // Lagre URL fra Storage (eller null)
+            createdAt: serverTimestamp(),
+            reactions: {},
+            comments: []
+        });
+        setShowLogSwimModal(false);
+    } catch (error) {
+        console.error("Feil ved logging av bad:", error);
+        alert("Kunne ikke logge badet. Prøv igjen.");
+        // TODO: Vurder å slette bildet fra Storage hvis Firestore feilet?
+    } finally {
+        setLoadingData(false);
+    }
+  };
+
+  // Legg til planlagt bad (Firestore)
+  const addPlannedSwim = async (plannedSwimData) => {
+    if (!authUser) return;
+    const { date, time, location, description } = plannedSwimData;
+
+    setLoadingData(true);
+    try {
+        await addDoc(collection(db, "plannedSwims"), {
+            plannerId: authUser.uid,
+            date: Timestamp.fromDate(new Date(date)), // Konverter til Timestamp
+            time: time,
+            location: location,
+            description: description || null,
+            attendees: [authUser.uid], // Planlegger er automatisk med
+            createdAt: serverTimestamp(),
+        });
+        setShowPlannedSwimModal(false);
+    } catch (error) {
+        console.error("Feil ved planlegging av bad:", error);
+        alert("Kunne ikke planlegge badet. Prøv igjen.");
+    } finally {
+        setLoadingData(false);
+    }
+  };
+
+  // Slett bad (Firestore & Storage)
+  const deleteSwim = async (swimId, imageUrl) => {
+      if (!authUser) return;
+      if (window.confirm("Er du sikker på at du vil slette dette badet?")) {
+          setLoadingData(true);
+          try {
+              // 1. Slett dokument fra Firestore
+              await deleteDoc(doc(db, "swims", swimId));
+
+              // 2. Slett bilde fra Storage hvis det finnes
+              if (imageUrl) {
+                  const imageRef = ref(storage, imageUrl); // Få referanse fra URL
+                  await deleteObject(imageRef);
+              }
+          } catch (error) {
+              console.error("Feil ved sletting av bad:", error);
+              alert("Kunne ikke slette badet.");
+          } finally {
+              setLoadingData(false);
+          }
+      }
+  };
+
+  // Slett planlagt bad (Firestore)
+  const deletePlannedSwim = async (plannedSwimId) => {
+      if (!authUser) return;
+       if (window.confirm("Er du sikker på at du vil slette dette planlagte badet?")) {
+           setLoadingData(true);
+            try {
+                await deleteDoc(doc(db, "plannedSwims", plannedSwimId));
+            } catch (error) {
+                console.error("Feil ved sletting av planlagt bad:", error);
+                alert("Kunne ikke slette planlagt bad.");
+            } finally {
+                setLoadingData(false);
+            }
+       }
+  };
+
+  // Håndter reaksjoner (Firestore)
+    const toggleReaction = async (swimId, reactionId) => {
+        if (!authUser) return;
+        const swimRef = doc(db, "swims", swimId);
+        try {
+            const swimDoc = await getDoc(swimRef);
+            if (!swimDoc.exists()) return;
+
+            const reactions = swimDoc.data().reactions || {};
+            const reactedByUsers = reactions[reactionId] || [];
+
+            if (reactedByUsers.includes(authUser.uid)) {
+                // Fjern reaksjon
+                await updateDoc(swimRef, {
+                    [`reactions.${reactionId}`]: arrayRemove(authUser.uid)
+                });
+            } else {
+                // Legg til reaksjon
+                 await updateDoc(swimRef, {
+                    [`reactions.${reactionId}`]: arrayUnion(authUser.uid)
+                });
+            }
+        } catch (error) {
+            console.error("Feil ved oppdatering av reaksjon:", error);
+        }
+    };
+
+    // Legg til kommentar (Firestore)
+    const addComment = async (swimId, commentText) => {
+        if (!authUser || !commentText.trim()) return;
+        const swimRef = doc(db, "swims", swimId);
+        try {
+            await updateDoc(swimRef, {
+                comments: arrayUnion({
+                    userId: authUser.uid,
+                    text: commentText,
+                    createdAt: Timestamp.now() // Bruk Timestamp for sortering
+                })
+            });
+        } catch (error) {
+            console.error("Feil ved tillegg av kommentar:", error);
+        }
+    };
+
+    // Påmelding/avmelding planlagt bad (Firestore)
+    const toggleAttendPlannedSwim = async (plannedSwimId) => {
+        if (!authUser) return;
+        const plannedSwimRef = doc(db, "plannedSwims", plannedSwimId);
+        try {
+             const plannedDoc = await getDoc(plannedSwimRef);
+            if (!plannedDoc.exists()) return;
+
+            const attendees = plannedDoc.data().attendees || [];
+
+            if (attendees.includes(authUser.uid)) {
+                 await updateDoc(plannedSwimRef, {
+                    attendees: arrayRemove(authUser.uid)
+                });
+            } else {
+                 await updateDoc(plannedSwimRef, {
+                    attendees: arrayUnion(authUser.uid)
+                });
+            }
+        } catch (error) {
+            console.error("Feil ved på/avmelding:", error);
+        }
+    };
+
+    // Oppdater brukerprofil (Firestore & Storage)
+    const updateUserProfile = async (updatedData) => {
+        if (!authUser) return;
+        const { name, newAvatarFile } = updatedData;
+        const userDocRef = doc(db, "users", authUser.uid);
+        setLoadingData(true);
+
+        try {
+            let avatarUrl = currentUserProfile?.avatarUrl || null; // Start med eksisterende
+
+            // 1. Håndter bildeopplasting/sletting
+            if (newAvatarFile === null && currentUserProfile?.avatarUrl) {
+                // Bruker vil fjerne bildet
+                const oldImageRef = ref(storage, currentUserProfile.avatarUrl);
+                try {
+                    await deleteObject(oldImageRef);
+                    avatarUrl = null;
+                } catch (deleteError) {
+                     // Logg feil, men fortsett (kanskje filen ikke fantes)
+                    console.warn("Kunne ikke slette gammelt profilbilde:", deleteError);
+                    avatarUrl = null; // Sett til null uansett
+                }
+            } else if (newAvatarFile instanceof File) {
+                 // Bruker laster opp nytt bilde
+                 // Slett gammelt bilde først hvis det finnes
+                 if (currentUserProfile?.avatarUrl) {
+                    const oldImageRef = ref(storage, currentUserProfile.avatarUrl);
+                     try { await deleteObject(oldImageRef); } catch (e) { console.warn("Kunne ikke slette gammelt bilde ved oppdatering:", e)}
+                 }
+                 // Last opp nytt
+                const newImageRef = ref(storage, `profileImages/${authUser.uid}/${Date.now()}_${newAvatarFile.name}`);
+                const snapshot = await uploadBytes(newImageRef, newAvatarFile);
+                avatarUrl = await getDownloadURL(snapshot.ref);
+            }
+            // Hvis newAvatarFile er undefined (ikke endret), beholdes eksisterende avatarUrl
+
+            // 2. Oppdater Firestore
+            await updateDoc(userDocRef, {
+                name: name,
+                avatarUrl: avatarUrl, // Oppdatert eller nullstilt URL
+            });
+
+            setShowEditProfileModal(false);
+        } catch (error) {
+            console.error("Feil ved oppdatering av profil:", error);
+            alert("Kunne ikke oppdatere profilen.");
+        } finally {
+            setLoadingData(false);
+        }
+    };
+
+
+  // --- UI Rendering ---
+
+  // Viser lasteindikator mens auth sjekkes
+  if (loadingAuth) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-sky-50">
+        <Loader2 className="animate-spin text-sky-600" size={48} />
+      </div>
+    );
+  }
+
+  // Viser Auth-skjerm hvis ikke pålogget
+  if (!authUser) {
+    return <AuthScreen onSignIn={handleSignIn} onSignUp={handleSignUp} />;
+  }
+
+  // Viser hovedappen hvis pålogget
+  return (
+    <div className="min-h-screen bg-sky-50 font-sans relative">
+      {/* Viser global lasteindikator for dataoperasjoner */}
+      {loadingData && (
+          <div className="fixed inset-0 bg-white bg-opacity-75 flex items-center justify-center z-[200]">
+              <Loader2 className="animate-spin text-sky-600" size={48} />
+          </div>
+      )}
+      <Navbar 
+        currentUserProfile={currentUserProfile} 
+        onSignOut={handleSignOut} 
+        onViewProfile={() => viewUserProfile(authUser.uid)}
+        setCurrentPage={setCurrentPage}
+        setProfileUserIdToView={setProfileUserIdToView}
+        currentPage={currentPage}
+        profileUserIdToView={profileUserIdToView}
+        onShowLogSwim={() => setShowLogSwimModal(true)}
+        onShowPlannedSwim={() => setShowPlannedSwimModal(true)}
+      />
+      <LogSwimModal 
+        isOpen={showLogSwimModal} 
+        onClose={() => setShowLogSwimModal(false)} 
+        onAddSwim={addSwim} 
+      />
+      <PlannedSwimModal 
+        isOpen={showPlannedSwimModal}
+        onClose={() => setShowPlannedSwimModal(false)}
+        onAddPlannedSwim={addPlannedSwim}
+      />
+       {currentUserProfile && ( // Vis kun EditProfileModal hvis profil er lastet
+           <EditProfileModal
+            isOpen={showEditProfileModal}
+            onClose={() => setShowEditProfileModal(false)}
+            currentUserProfile={currentUserProfile}
+            onUpdateProfile={updateUserProfile}
+           />
+       )}
+      
+      <main className="pb-20"> 
+        {renderPage()}
+      </main>
+      <button
+            onClick={() => setShowLogSwimModal(true)}
+            title="Logg nytt bad"
+            className="fixed bottom-5 right-5 lg:hidden bg-sky-600 text-white p-4 rounded-full shadow-xl hover:bg-sky-700 transition-transform active:scale-95 z-50 flex items-center justify-center"
+        >
+            <PlusCircle size={28} />
+        </button>
+    </div>
+  );
+
+  // Funksjon for å rendre riktig side
+  function renderPage() {
+    if (profileUserIdToView && currentPage === 'profile') {
+        return <UserProfilePage 
+                    userIdToView={profileUserIdToView} 
+                    allUserProfiles={userProfiles} 
+                    swims={swims} 
+                    plannedSwims={plannedSwims}
+                    currentAuthUser={authUser} 
+                    onViewUserProfile={viewUserProfile}
+                    onToggleAttend={toggleAttendPlannedSwim}
+                    onDeletePlannedSwim={deletePlannedSwim}
+                    onToggleReaction={toggleReaction}
+                    onAddComment={addComment}
+                    onDeleteSwim={deleteSwim}
+                    onEditProfile={() => setShowEditProfileModal(true)}
+                    goBack={() => { setCurrentPage('feed'); setProfileUserIdToView(null); }}
+                />;
+    }
+    switch (currentPage) {
+      case 'feed':
+        return <SwimFeed 
+                    swims={swims} 
+                    plannedSwims={plannedSwims} 
+                    allUserProfiles={userProfiles} 
+                    currentAuthUser={authUser} 
+                    onViewUserProfile={viewUserProfile}
+                    onToggleAttend={toggleAttendPlannedSwim}
+                    onDeletePlannedSwim={deletePlannedSwim}
+                    onToggleReaction={toggleReaction}
+                    onAddComment={addComment}
+                    onDeleteSwim={deleteSwim}
+                    onShowLogSwim={() => setShowLogSwimModal(true)}
+                    onShowPlannedSwim={() => setShowPlannedSwimModal(true)}
+                />;
+      case 'planned':
+        return <PlannedSwimsPage 
+                    plannedSwims={plannedSwims}
+                    allUserProfiles={userProfiles} 
+                    currentAuthUser={authUser}
+                    onShowPlannedSwim={() => setShowPlannedSwimModal(true)}
+                    onToggleAttend={toggleAttendPlannedSwim}
+                    onDeletePlannedSwim={deletePlannedSwim}
+                    onViewUserProfile={viewUserProfile}
+                />;
+      case 'leaderboard':
+        return <LeaderboardPage 
+                    leaderboardData={leaderboardData} 
+                    currentAuthUser={authUser} 
+                    onViewUserProfile={viewUserProfile} 
+                />;
+      default:
+        return <SwimFeed 
+                    swims={swims} 
+                    plannedSwims={plannedSwims} 
+                    allUserProfiles={userProfiles} 
+                    currentAuthUser={authUser} 
+                    onViewUserProfile={viewUserProfile}
+                    onToggleAttend={toggleAttendPlannedSwim}
+                    onDeletePlannedSwim={deletePlannedSwim}
+                    onToggleReaction={toggleReaction}
+                    onAddComment={addComment}
+                    onDeleteSwim={deleteSwim}
+                    onShowLogSwim={() => setShowLogSwimModal(true)}
+                    onShowPlannedSwim={() => setShowPlannedSwimModal(true)}
+                />;
+    }
+  };
+}
+
+
+// --- Autentiseringskomponent ---
+function AuthScreen({ onSignIn, onSignUp }) {
+  const [isLogin, setIsLogin] = useState(true);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [name, setName] = useState(''); // Kun for registrering
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    if (isLogin) {
+      await onSignIn(email, password);
+    } else {
+      await onSignUp(email, password, name);
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-sky-100 to-sky-300 p-4">
+      <div className="bg-white p-8 rounded-xl shadow-2xl w-full max-w-md">
+        <h1 className="text-3xl font-bold text-center text-sky-700 mb-6 flex items-center justify-center">
+          <Snowflake className="mr-3 text-sky-500" size={36}/> BadeKompis 2025
+        </h1>
+        <h2 className="text-xl font-semibold text-center text-gray-700 mb-8">
+          {isLogin ? 'Logg inn' : 'Opprett bruker'}
+        </h2>
+        <form onSubmit={handleSubmit} className="space-y-6">
+          {!isLogin && (
+            <div>
+              <label htmlFor="name" className="block text-sm font-medium text-gray-700">Navn</label>
+              <input
+                id="name"
+                name="name"
+                type="text"
+                required
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-sky-500 focus:border-sky-500 sm:text-sm"
+                placeholder="Ditt navn"
+              />
+            </div>
+          )}
+          <div>
+            <label htmlFor="email" className="block text-sm font-medium text-gray-700">E-postadresse</label>
+            <input
+              id="email"
+              name="email"
+              type="email"
+              autoComplete="email"
+              required
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-sky-500 focus:border-sky-500 sm:text-sm"
+              placeholder="deg@eksempel.com"
+            />
+          </div>
+          <div>
+            <label htmlFor="password"className="block text-sm font-medium text-gray-700">Passord</label>
+            <input
+              id="password"
+              name="password"
+              type="password"
+              autoComplete={isLogin ? "current-password" : "new-password"}
+              required
+              minLength={6} // Firebase krever minst 6 tegn
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-sky-500 focus:border-sky-500 sm:text-sm"
+              placeholder="Minst 6 tegn"
+            />
+          </div>
+          <div>
+            <button
+              type="submit"
+              disabled={loading}
+              className="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-sky-600 hover:bg-sky-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-sky-500 disabled:opacity-50"
+            >
+              {loading ? <Loader2 className="animate-spin"/> : (isLogin ? 'Logg inn' : 'Registrer deg')}
+            </button>
+          </div>
+        </form>
+        <p className="mt-6 text-center text-sm text-gray-600">
+          {isLogin ? 'Har du ikke bruker?' : 'Har du allerede bruker?'}
+          <button onClick={() => setIsLogin(!isLogin)} className="font-medium text-sky-600 hover:text-sky-500 ml-1">
+            {isLogin ? 'Registrer deg her' : 'Logg inn her'}
+          </button>
+        </p>
+      </div>
+    </div>
+  );
+}
+
+
+// --- Komponenter for Appen (Mange av disse må oppdateres for Firebase) ---
+
+// Navbar (Oppdatert for Firebase Auth)
+const Navbar = ({ currentUserProfile, onSignOut, onViewProfile, setCurrentPage, setProfileUserIdToView, currentPage, profileUserIdToView, onShowLogSwim, onShowPlannedSwim }) => {
+    const handleNavClick = (page) => {
+        setCurrentPage(page);
+        setProfileUserIdToView(null); // Nullstill profilvisning ved sidebytte
+    };
+    
+    return (
+        <nav className="bg-sky-600 text-white p-4 shadow-md sticky top-0 z-50">
+        <div className="container mx-auto flex flex-wrap justify-between items-center">
+            <h1 className="text-2xl font-bold cursor-pointer" onClick={() => handleNavClick('feed')}>
+            <Snowflake className="inline-block mr-2 mb-1" /> BadeKompis 2025
+            </h1>
+            <div className="space-x-1 sm:space-x-2 mt-2 sm:mt-0 flex items-center flex-wrap justify-center">
+            <NavButton icon={<Sun />} text="Feed" page="feed" activePage={profileUserIdToView ? '' : currentPage} onClick={() => handleNavClick('feed')} />
+            <NavButton icon={<PlusCircle />} text="Logg Bad" onClick={onShowLogSwim} />
+            <NavButton icon={<CalendarDays />} text="Planlagte Bad" page="planned" activePage={currentPage} onClick={() => handleNavClick('planned')} />
+            <NavButton icon={<Trophy />} text="Leaderboard" page="leaderboard" activePage={currentPage} onClick={() => handleNavClick('leaderboard')} />
+            
+            {/* Brukerprofil og utlogging */}
+            {currentUserProfile && (
+                <div className="relative ml-1 flex items-center">
+                    <Avatar 
+                        userProfile={currentUserProfile} 
+                        sizeClass="w-8 h-8 text-sm" 
+                        extraClasses="mr-2 border-2 border-sky-400 cursor-pointer hover:opacity-80"
+                        onClick={onViewProfile} // Gå til egen profil
+                        title={`Se ${currentUserProfile.name} sin profil`}
+                    />
+                    <span className="text-xs sm:text-sm font-medium mr-2 truncate max-w-[100px]">{currentUserProfile.name}</span>
+                    <button 
+                        onClick={onSignOut} 
+                        title="Logg ut"
+                        className="p-2 rounded-md hover:bg-sky-700 transition-colors"
+                    >
+                        <LogOut size={20} />
+                    </button>
+                </div>
+            )}
+            </div>
+        </div>
+        </nav>
+    );
+};
+
+// NavButton (uendret)
+const NavButton = ({ icon, text, page, onClick, activePage }) => (
+    <button
+      onClick={onClick}
+      className={`px-2 py-2 sm:px-3 rounded-md text-xs sm:text-sm font-medium hover:bg-sky-700 transition-colors flex items-center
+                  ${(activePage === page && !onClick?.toString().includes("onShowLogSwim")) ? 'bg-sky-800' : ''}`}
+    >
+      {icon && React.cloneElement(icon, { className: "mr-1 h-4 w-4 sm:h-5 sm:w-5 shrink-0" })} 
+      <span className="ml-1">{text}</span>
+    </button>
+);
+
+// LogSwimModal (Oppdatert for Firebase)
+const LogSwimModal = ({ isOpen, onClose, onAddSwim }) => {
+    const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
+    const [description, setDescription] = useState('');
+    const [location, setLocation] = useState('');
+    const [imagePreviewUrl, setImagePreviewUrl] = useState(null);
+    const [imageFile, setImageFile] = useState(null); // Holder selve filobjektet
+    const [isCameraActive, setIsCameraActive] = useState(false);
+    const videoRef = useRef(null);
+    const canvasRef = useRef(null);
+    const fileInputRef = useRef(null); 
+
+    const stopCamera = useCallback(() => { // Bruker useCallback for å unngå unødvendig re-creation
+        if (videoRef.current && videoRef.current.srcObject) {
+            videoRef.current.srcObject.getTracks().forEach(track => track.stop());
+            videoRef.current.srcObject = null;
+        }
+        setIsCameraActive(false);
+    }, []); // Tom dependency array
+
+    const handleImageFileChange = (event) => {
+        stopCamera(); 
+        const file = event.target.files[0];
+        if (file && file.type.startsWith("image/")) {
+             setImageFile(file); // Lagre filen
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                setImagePreviewUrl(reader.result);
+            };
+            reader.readAsDataURL(file);
+        } else {
+            setImageFile(null);
+            setImagePreviewUrl(null);
+        }
+    };
+
+    const startCamera = async () => {
+        setImagePreviewUrl(null); 
+        setImageFile(null); // Nullstill fil hvis kamera brukes
+        if (fileInputRef.current) fileInputRef.current.value = null; 
+
+        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } }); // Prøv å bruke bak-kamera
+                setIsCameraActive(true);
+                setTimeout(() => {
+                    if (videoRef.current) {
+                        videoRef.current.srcObject = stream;
+                    }
+                }, 100); 
+            } catch (err) {
+                console.error("Feil ved tilgang til kamera:", err);
+                 try { // Fallback til default kamera hvis environment feiler
+                     const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+                     setIsCameraActive(true);
+                     setTimeout(() => { if (videoRef.current) videoRef.current.srcObject = stream; }, 100);
+                 } catch (fallbackErr) {
+                     console.error("Feil ved tilgang til fallback-kamera:", fallbackErr);
+                     alert("Kunne ikke få tilgang til kamera. Sjekk tillatelser.");
+                     setIsCameraActive(false);
+                 }
+            }
+        } else {
+            alert("Kamera-API støttes ikke av denne nettleseren.");
+        }
+    };
+
+    const captureImage = () => {
+        if (videoRef.current && canvasRef.current) {
+            const video = videoRef.current;
+            const canvas = canvasRef.current;
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const context = canvas.getContext('2d');
+            context.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const dataUrl = canvas.toDataURL('image/jpeg'); 
+            setImagePreviewUrl(dataUrl);
+            setImageFile(null); // Nullstill fil hvis bildet er tatt med kamera
+            stopCamera(); 
+        }
+    };
+
+    const resetForm = useCallback(() => {
+        stopCamera();
+        setDate(new Date().toISOString().split('T')[0]);
+        setDescription('');
+        setLocation('');
+        setImageFile(null);
+        setImagePreviewUrl(null);
+        if (fileInputRef.current) {
+            fileInputRef.current.value = null;
+        }
+    }, [stopCamera]); // Inkluder stopCamera i dependencies
+
+    const handleSubmit = (e) => {
+      e.preventDefault();
+      if (!description.trim()) {
+        alert("Beskrivelse kan ikke være tom.");
+        return;
+      }
+      // Send med imageFile hvis det finnes, ellers imagePreviewUrl (fra kamera)
+      onAddSwim({ date, description, location, imageFile: imageFile, imageDataUrl: imageFile ? null : imagePreviewUrl }); 
+      resetForm();
+    };
+
+    useEffect(() => {
+        // Sørg for å stoppe kameraet når modalen lukkes
+        if (!isOpen) {
+            stopCamera();
+        }
+    }, [isOpen, stopCamera]);
+
+    if (!isOpen) return null;
+
+    return (
+      <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-[100] p-4 overflow-y-auto">
+        <div className="bg-white p-6 rounded-lg shadow-xl w-full max-w-md transform transition-all my-auto">
+          <h2 className="text-2xl font-semibold mb-4 text-sky-700">Logg nytt bad! <Snowflake className="inline-block ml-2 text-sky-500" /></h2>
+          <form onSubmit={handleSubmit} className="space-y-4">
+             {/* Dato, Sted, Beskrivelse felter ... */}
+              <div>
+              <label htmlFor="log-date" className="block text-sm font-medium text-gray-700">Dato:</label>
+              <input type="date" id="log-date" value={date} onChange={e => setDate(e.target.value)} required 
+                     className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-sky-500 focus:border-sky-500 sm:text-sm"/>
+            </div>
+            <div>
+              <label htmlFor="log-location" className="block text-sm font-medium text-gray-700">Sted (valgfritt):</label>
+              <input type="text" id="log-location" value={location} onChange={e => setLocation(e.target.value)} placeholder="F.eks. Paradisbukta"
+                     className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-sky-500 focus:border-sky-500 sm:text-sm"/>
+            </div>
+            <div>
+              <label htmlFor="log-description" className="block text-sm font-medium text-gray-700">Beskrivelse/Kommentar:</label>
+              <textarea id="log-description" value={description} onChange={e => setDescription(e.target.value)} rows="3" required placeholder="Hvordan var badet?"
+                        className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-sky-500 focus:border-sky-500 sm:text-sm"></textarea>
+            </div>
+            {/* Bildebevis Seksjon */}
+            <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Bildebevis (valgfritt):</label>
+                <div className="mb-2 border border-gray-300 rounded-md overflow-hidden bg-gray-100 min-h-[200px] flex items-center justify-center">
+                    {isCameraActive ? (
+                        <video ref={videoRef} autoPlay playsInline className="w-full h-auto max-h-60 object-contain"></video>
+                    ) : imagePreviewUrl ? (
+                        <img src={imagePreviewUrl} alt="Forhåndsvisning av bildebevis" className="w-full h-auto max-h-60 object-contain" />
+                    ) : (
+                         <div className="text-center text-gray-500 p-4">
+                            <ImageIcon size={48} className="mx-auto mb-2"/>
+                            Ingen bilde valgt
+                         </div>
+                    )}
+                </div>
+                 <canvas ref={canvasRef} style={{ display: 'none' }}></canvas>
+                <div className="flex flex-wrap gap-2 justify-center">
+                    {!isCameraActive && (
+                         <button 
+                            type="button"
+                            onClick={() => fileInputRef.current?.click()} 
+                            className="flex-1 inline-flex items-center justify-center px-4 py-2 border border-gray-300 shadow-sm text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50"
+                        >
+                            <UploadCloud size={18} className="mr-2"/> Velg fil
+                        </button>
+                    )}
+                    <input 
+                        ref={fileInputRef}
+                        id="swimImageUpload" 
+                        type="file" 
+                        className="hidden" 
+                        accept="image/*" 
+                        onChange={handleImageFileChange} 
+                    />
+                    {isCameraActive ? (
+                        <>
+                            <button 
+                                type="button"
+                                onClick={captureImage}
+                                className="flex-1 inline-flex items-center justify-center px-4 py-2 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-red-600 hover:bg-red-700"
+                            >
+                                <Camera size={18} className="mr-2"/> Ta bilde
+                            </button>
+                             <button 
+                                type="button"
+                                onClick={stopCamera}
+                                className="flex-1 inline-flex items-center justify-center px-4 py-2 border border-gray-300 shadow-sm text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50"
+                            >
+                                <VideoOff size={18} className="mr-2"/> Lukk kamera
+                            </button>
+                        </>
+                    ) : (
+                        <button 
+                            type="button"
+                            onClick={startCamera}
+                            className="flex-1 inline-flex items-center justify-center px-4 py-2 border border-gray-300 shadow-sm text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50"
+                        >
+                           <Video size={18} className="mr-2"/> Bruk kamera
+                        </button>
+                    )}
+                </div>
+                 {!isCameraActive && imagePreviewUrl && (
+                      <button 
+                        type="button" 
+                        onClick={() => {
+                            setImagePreviewUrl(null); 
+                            setImageFile(null);
+                            if (fileInputRef.current) fileInputRef.current.value = null;
+                        }}
+                        className="mt-2 w-full text-xs text-red-500 hover:text-red-700 flex items-center justify-center"
+                    >
+                        <XCircle size={14} className="mr-1"/> Fjern valgt bilde
+                    </button>
+                 )}
+            </div>
+            <div className="flex justify-end space-x-3 pt-4">
+              <button type="button" onClick={() => { onClose(); resetForm(); }}
+                      className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-200 rounded-md hover:bg-gray-300 transition-colors">
+                Avbryt
+              </button>
+              <button type="submit"
+                      className="px-4 py-2 text-sm font-medium text-white bg-sky-600 rounded-md hover:bg-sky-700 transition-colors flex items-center">
+                <PlusCircle size={18} className="mr-2"/> Loggfør bad
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    );
+};
+
+// SwimCard (Oppdatert for Firebase data)
+const SwimCard = ({ swim, allUserProfiles, currentAuthUser, onToggleReaction, onAddComment, onDeleteSwim, onViewUserProfile }) => {
+    const [commentText, setCommentText] = useState('');
+    const [showComments, setShowComments] = useState(false);
+
+    const swimUserProfile = allUserProfiles[swim.userId]; // Hent profil basert på userId
+    if (!swimUserProfile) return <div className="text-gray-500 p-4 text-sm italic">Laster brukerinfo...</div>; // Eller vis en placeholder
+
+    const handleAddComment = () => {
+      if (!currentAuthUser) return; 
+      onAddComment(swim.id, commentText);
+      setCommentText('');
+    };
+    
+    const swimReactions = swim.reactions || {};
+    const currentUserId = currentAuthUser?.uid;
+
+    return (
+      <div className="bg-white rounded-xl shadow-lg overflow-hidden mb-6 transition-transform hover:scale-[1.01]">
+        <div className="p-5">
+          <div className="flex items-center mb-3">
+            <Avatar 
+                userProfile={swimUserProfile} 
+                extraClasses="mr-3 cursor-pointer" 
+                onClick={() => onViewUserProfile(swimUserProfile.id)}
+                title={`Se ${swimUserProfile.name} sin profil`}
+            />
+            <div>
+              <p 
+                className="font-semibold text-sky-700 hover:underline cursor-pointer"
+                onClick={() => onViewUserProfile(swimUserProfile.id)}
+                title={`Se ${swimUserProfile.name} sin profil`}
+              >
+                {swimUserProfile.name || 'Ukjent Bruker'}
+              </p>
+              {/* Bruk formatDate med swim.date (som nå er et Timestamp) */}
+              <p className="text-xs text-gray-500">{formatDate(swim.date)} {swim.location && ` - ${swim.location}`}</p>
+            </div>
+            {currentUserId && swim.userId === currentUserId && (
+                // Send med swim.imageUrl til delete-funksjonen
+                <button onClick={() => onDeleteSwim(swim.id, swim.imageUrl)} title="Slett bad" className="ml-auto text-red-500 hover:text-red-700 p-1">
+                    <Trash2 size={20} />
+                </button>
+            )}
+          </div>
+          <p className="text-gray-700 mb-3">{swim.description}</p>
+          {/* Bruker swim.imageUrl som kommer fra Firestore/Storage */}
+          {swim.imageUrl && (
+            <div className="mb-3 rounded-lg overflow-hidden aspect-video bg-gray-200">
+              <img 
+                src={swim.imageUrl} 
+                alt="Badebevis" 
+                className="w-full h-full object-cover" 
+                onError={(e) => { e.target.onerror = null; e.target.src="https://placehold.co/600x400/e2e8f0/94a3b8?text=Bilde+mangler"; }}
+              />
+            </div>
+          )}
+          {currentUserId && ( 
+            <div className="flex items-center justify-start text-gray-600 gap-x-1 gap-y-2 flex-wrap mb-2">
+                {reactionTypes.map(reaction => {
+                const reactionUsers = swimReactions[reaction.id] || [];
+                const count = reactionUsers.length;
+                const userHasReacted = reactionUsers.includes(currentUserId);
+                return (
+                    <button 
+                    key={reaction.id} 
+                    onClick={() => onToggleReaction(swim.id, reaction.id)} 
+                    title={reaction.label}
+                    className={`flex items-center space-x-1 px-2 py-1 rounded-full text-xs sm:text-sm border transition-colors
+                                ${userHasReacted ? 'bg-sky-100 border-sky-500 text-sky-600' : 'bg-gray-100 border-gray-300 hover:bg-gray-200'}`}
+                    >
+                    <span>{reaction.emoji}</span>
+                    {count > 0 && <span className="font-medium">{count}</span>}
+                    </button>
+                );
+                })}
+            </div>
+          )}
+          <button onClick={() => setShowComments(!showComments)} className="flex items-center space-x-1 hover:text-sky-500 transition-colors p-1 text-sm text-gray-500">
+            <MessageSquare size={18} /> <span>{swim.comments?.length || 0} {swim.comments?.length === 1 ? 'Kommentar' : 'Kommentarer'}</span>
+          </button>
+        </div>
+        {showComments && (
+          <div className="p-5 border-t border-gray-200 bg-gray-50">
+            <h4 className="font-semibold text-sm mb-2 text-gray-700">Kommentarer:</h4>
+            {swim.comments && swim.comments.length > 0 ? (
+              <ul className="space-y-2 mb-3 max-h-40 overflow-y-auto">
+                {/* Sorter kommentarer etter tid */}
+                {[...swim.comments].sort((a, b) => a.createdAt?.toDate() - b.createdAt?.toDate()).map((comment, index) => {
+                    const commentUserProfile = allUserProfiles[comment.userId];
+                    if (!commentUserProfile) return <li key={index} className="text-xs text-red-500">Kommentarbruker ikke funnet</li>;
+                    return (
+                      <li key={comment.createdAt?.seconds || index} className="text-xs text-gray-600 bg-white p-2 rounded-md shadow-sm">
+                        <span 
+                            className="font-semibold text-sky-700 hover:underline cursor-pointer"
+                            onClick={() => onViewUserProfile(comment.userId)}
+                        >
+                            {commentUserProfile.name || 'Ukjent'}:
+                        </span> {comment.text}
+                        <span className="text-gray-400 text-[10px] ml-2">{formatDate(comment.createdAt)}</span>
+                      </li>
+                    );
+                })}
+              </ul>
+            ) : <p className="text-xs text-gray-500 mb-3">Ingen kommentarer enda.</p>}
+            {currentUserId && ( 
+                <div className="flex">
+                <input 
+                    type="text" 
+                    value={commentText} 
+                    onChange={e => setCommentText(e.target.value)} 
+                    placeholder="Skriv en kommentar..."
+                    className="flex-grow p-2 border border-gray-300 rounded-l-md text-sm focus:ring-sky-500 focus:border-sky-500"
+                />
+                <button onClick={handleAddComment} className="bg-sky-500 text-white px-3 py-2 rounded-r-md hover:bg-sky-600 text-sm">Send</button>
+                </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+};
+
+// PlannedSwimFeedCard (Oppdatert for Firebase data)
+const PlannedSwimFeedCard = ({ plannedSwim, allUserProfiles, currentAuthUser, onToggleAttend, onDeletePlannedSwim, onViewUserProfile }) => {
+    const isNew = plannedSwim.createdAt && (new Date().getTime() - plannedSwim.createdAt.toDate().getTime()) < 24 * 60 * 60 * 1000;
+    const currentUserId = currentAuthUser?.uid;
+    const userIsAttending = currentUserId && plannedSwim.attendees?.includes(currentUserId);
+    const plannerProfile = allUserProfiles[plannedSwim.plannerId];
+
+    if (!plannerProfile) return <div className="text-gray-500 p-4 text-sm italic">Laster planleggerinfo...</div>;
+
+    return (
+      <div className="bg-white rounded-xl shadow-lg overflow-hidden mb-6 border-l-4 border-teal-500 transition-transform hover:scale-[1.01]">
+        <div className="p-5">
+          <div className="flex items-start mb-3">
+             <Avatar 
+                userProfile={plannerProfile} 
+                extraClasses="mr-3 cursor-pointer" 
+                onClick={() => onViewUserProfile(plannerProfile.id)}
+                title={`Se ${plannerProfile.name} sin profil`}
+            />
+            <div className="flex-grow">
+              <p className="font-semibold text-teal-700">Planlagt bad: {plannedSwim.location}</p>
+              <p className="text-xs text-gray-500">
+                Planlagt av: <span 
+                                className="font-medium hover:underline cursor-pointer" 
+                                onClick={() => onViewUserProfile(plannerProfile.id)}
+                                title={`Se ${plannerProfile.name} sin profil`}
+                            >
+                                {plannerProfile.name}
+                            </span>
+              </p>
+            </div>
+            {isNew && (
+              <span className="ml-auto bg-pink-500 text-white text-xs font-semibold px-2 py-1 rounded-full flex items-center self-start shrink-0">
+                <Zap size={14} className="mr-1" /> Nytt!
+              </span>
+            )}
+             {currentUserId && plannedSwim.plannerId === currentUserId && (
+                <button onClick={() => onDeletePlannedSwim(plannedSwim.id)} title="Slett planlagt bad" className="ml-2 text-red-500 hover:text-red-700 p-1 self-start">
+                    <Trash2 size={20} />
+                </button>
+            )}
+          </div>
+
+          <div className="space-y-1 text-sm text-gray-700 mb-3">
+            <div className="flex items-center">
+                <MapPin size={16} className="mr-2 text-teal-600 shrink-0" /> <span>{plannedSwim.location}</span>
+            </div>
+            <div className="flex items-center">
+                <CalendarDays size={16} className="mr-2 text-teal-600 shrink-0" /> <span>{formatDate(plannedSwim.date)}</span>
+            </div>
+            <div className="flex items-center">
+                <Clock size={16} className="mr-2 text-teal-600 shrink-0" /> <span>Kl. {formatTime(plannedSwim.time)}</span>
+            </div>
+          </div>
+          
+          {plannedSwim.description && <p className="text-gray-600 my-2 bg-gray-100 p-2 rounded-md text-sm">{plannedSwim.description}</p>}
+          
+          {currentUserId && ( 
+            <div className="mt-4">
+                <button
+                onClick={() => onToggleAttend(plannedSwim.id)}
+                className={`w-full sm:w-auto px-4 py-2 rounded-md text-sm font-medium transition-colors flex items-center justify-center
+                    ${userIsAttending 
+                    ? 'bg-red-100 hover:bg-red-200 text-red-700 border border-red-300' 
+                    : 'bg-green-500 hover:bg-green-600 text-white'}`}
+                >
+                <UserPlus size={18} className="mr-2"/>
+                {userIsAttending ? 'Meld av' : 'Bli med!'} ({plannedSwim.attendees?.length || 0} påmeldt)
+                </button>
+                <div className="mt-2 text-xs text-gray-500">
+                Påmeldte: {plannedSwim.attendees?.map(uid => {
+                    const attendeeProfile = allUserProfiles[uid];
+                    return attendeeProfile?.name || 'Ukjent';
+                }).join(', ') || 'Ingen enda'}
+                </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+};
+
+// SwimFeed (Oppdatert for Firebase data)
+const SwimFeed = ({ swims, plannedSwims, allUserProfiles, currentAuthUser, onViewUserProfile, onToggleAttend, onDeletePlannedSwim, onToggleReaction, onAddComment, onDeleteSwim, onShowLogSwim, onShowPlannedSwim }) => {
+    
+    const currentUserProfile = currentAuthUser ? allUserProfiles[currentAuthUser.uid] : null;
+    const currentUserSwims = currentUserProfile ? swims.filter(s => s.userId === currentUserProfile.id).sort((a, b) => b.createdAt?.toDate() - a.createdAt?.toDate()) : [];
+    const lastSwimDate = currentUserSwims.length > 0 ? currentUserSwims[0].createdAt : null; // Bruker createdAt for nøyaktighet
+    
+    let showInactivityReminder = false;
+    if (currentUserProfile && lastSwimDate) {
+      const sevenDaysAgo = new Date();
+      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+      if (lastSwimDate.toDate() < sevenDaysAgo) {
+        showInactivityReminder = true;
+      }
+    } else if (currentUserProfile && (swims.length > 0 || plannedSwims.length > 0)) { 
+        showInactivityReminder = true; // Hvis bruker finnes, men ikke har badet
+    }
+
+    const userProgress = currentUserProfile ? (swims.filter(s => s.userId === currentUserProfile.id).length) : 0;
+
+    const combinedFeed = useMemo(() => {
+        const loggedItems = swims.map(s => ({ ...s, sortDate: s.createdAt?.toDate() || new Date(0) })); 
+        const plannedItems = plannedSwims.map(ps => {
+            const [hours, minutes] = ps.time.split(':');
+            const sortDateTime = ps.date?.toDate() || new Date(); // Bruk date fra Firestore
+            sortDateTime.setHours(parseInt(hours, 10), parseInt(minutes, 10), 0, 0); 
+            return { ...ps, sortDate: sortDateTime };
+        });
+        
+        const allItems = [...loggedItems, ...plannedItems];
+        // Sorterer slik at nyeste kommer først
+        return allItems.sort((a, b) => b.sortDate.getTime() - a.sortDate.getTime());
+    }, [swims, plannedSwims]);
+
+
+    return (
+      <div className="max-w-2xl mx-auto py-6 px-4">
+        {currentUserProfile && userProgress > 0 && (
+          <div className="bg-white p-4 rounded-lg shadow-md mb-6">
+            <h3 className="text-lg font-semibold text-sky-700 mb-2">Din Fremgang i 2025</h3>
+            <ProgressBar value={userProgress} max={SWIM_GOAL} />
+            {userProgress >= SWIM_GOAL && <p className="text-green-600 font-semibold mt-2">🎉 Gratulerer, du har nådd målet! 🎉</p>}
+          </div>
+        )}
+
+        {showInactivityReminder && (
+          <div className="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-4 mb-6 rounded-md shadow" role="alert">
+            {/* ... (inaktivitetsmelding som før) ... */}
+             <div className="flex">
+              <div className="py-1"><AlertTriangle className="h-6 w-6 text-yellow-500 mr-3" /></div>
+              <div>
+                <p className="font-bold">Påminnelse!</p>
+                <p className="text-sm">
+                  {currentUserSwims.length > 0 
+                    ? `Det er over en uke siden sist du badet (${formatDate(lastSwimDate)}). På tide med en ny dukkert?`
+                    : `Du har ikke logget noen bad enda. Bli med på moroa!`}
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+         
+        {combinedFeed.length === 0 && currentUserProfile && (
+          <div className="text-center text-gray-500 py-10">
+            {/* ... (melding om tom feed som før) ... */}
+             <Snowflake size={48} className="mx-auto mb-4 text-sky-300" />
+            <h2 className="text-xl font-semibold mb-2">Ingenting i feeden enda!</h2>
+            <p>Loggfør et bad eller planlegg en felles badetur.</p>
+            <div className="mt-4 space-x-0 space-y-2 sm:space-y-0 sm:space-x-4 flex flex-col sm:flex-row justify-center items-center">
+                <button 
+                    onClick={onShowLogSwim}
+                    className="px-6 py-2 bg-sky-500 text-white rounded-lg hover:bg-sky-600 transition-colors flex items-center justify-center w-full sm:w-auto"
+                >
+                    <PlusCircle size={20} className="mr-2" /> Logg bad
+                </button>
+                <button 
+                    onClick={onShowPlannedSwim}
+                    className="px-6 py-2 bg-teal-500 text-white rounded-lg hover:bg-teal-600 transition-colors flex items-center justify-center w-full sm:w-auto"
+                >
+                    <CalendarDays size={20} className="mr-2" /> Planlegg bad
+                </button>
+            </div>
+          </div>
+        )}
+        {combinedFeed.map(item => {
+            if (item.itemType === 'logged') {
+                return <SwimCard 
+                            key={item.id} 
+                            swim={item} 
+                            allUserProfiles={allUserProfiles} 
+                            currentAuthUser={currentAuthUser} 
+                            onToggleReaction={onToggleReaction}
+                            onAddComment={onAddComment}
+                            onDeleteSwim={onDeleteSwim}
+                            onViewUserProfile={onViewUserProfile}
+                        />;
+            }
+            if (item.itemType === 'planned') {
+                return <PlannedSwimFeedCard 
+                            key={item.id} 
+                            plannedSwim={item} 
+                            allUserProfiles={allUserProfiles}
+                            currentAuthUser={currentAuthUser} 
+                            onToggleAttend={onToggleAttend}
+                            onDeletePlannedSwim={onDeletePlannedSwim}
+                            onViewUserProfile={onViewUserProfile}
+                        />;
+            }
+            return null;
+        })}
+      </div>
+    );
+};
+
+// PlannedSwimsPage (Oppdatert for Firebase data)
+const PlannedSwimsPage = ({ plannedSwims, allUserProfiles, currentAuthUser, onShowPlannedSwim, onToggleAttend, onDeletePlannedSwim, onViewUserProfile }) => (
+    <div className="max-w-2xl mx-auto py-6 px-4">
+      <div className="flex justify-between items-center mb-6">
+        <h2 className="text-3xl font-bold text-sky-700">Kommende Badeturer</h2>
+        <button 
+          onClick={onShowPlannedSwim}
+          className="bg-sky-500 text-white px-4 py-2 rounded-lg hover:bg-sky-600 transition-colors flex items-center shadow-md"
+        >
+          <PlusCircle size={20} className="mr-2" /> Planlegg nytt bad
+        </button>
+      </div>
+      {plannedSwims.length === 0 && (
+        <div className="text-center text-gray-500 py-10">
+          {/* ... (melding om ingen planlagte bad) ... */}
+           <CalendarDays size={48} className="mx-auto mb-4 text-sky-300" />
+          <h3 className="text-xl font-semibold mb-2">Ingen planlagte bad enda.</h3>
+          <p>Vær den første til å invitere til en dukkert!</p>
+        </div>
+      )}
+      {/* Sorter etter dato stigende */}
+      {[...plannedSwims].sort((a,b) => {
+          const dateA = a.date?.toDate() || new Date(0);
+          const [hA = 0, mA = 0] = a.time?.split(':') || [];
+          dateA.setHours(parseInt(hA), parseInt(mA));
+
+          const dateB = b.date?.toDate() || new Date(0);
+          const [hB = 0, mB = 0] = b.time?.split(':') || [];
+          dateB.setHours(parseInt(hB), parseInt(mB));
+          
+          return dateA.getTime() - dateB.getTime(); 
+      }).map(ps => {
+        return (
+            <PlannedSwimFeedCard 
+                key={ps.id}
+                plannedSwim={ps}
+                allUserProfiles={allUserProfiles}
+                currentAuthUser={currentAuthUser}
+                onToggleAttend={onToggleAttend}
+                onDeletePlannedSwim={onDeletePlannedSwim}
+                onViewUserProfile={onViewUserProfile}
+            />
+        );
+      })}
+    </div>
+  );
+
+// LeaderboardPage (Oppdatert for Firebase data)
+const LeaderboardPage = ({ leaderboardData, currentAuthUser, onViewUserProfile }) => (
+    <div className="max-w-2xl mx-auto py-6 px-4">
+      <h2 className="text-3xl font-bold text-center mb-6 text-sky-700"><Trophy className="inline-block mr-2 mb-1 text-yellow-400" />Topp Badere 2025!</h2>
+      <p className="text-center mb-8 text-gray-600">Målet er {SWIM_GOAL} bad i løpet av året. Lykke til alle sammen!</p>
+      
+      {leaderboardData.length === 0 && (
+         <div className="text-center text-gray-500 py-10">
+             {/* ... (melding om tomt leaderboard) ... */}
+              <Users size={48} className="mx-auto mb-4 text-sky-300" />
+              <h3 className="text-xl font-semibold mb-2">Ingen badere på listen enda.</h3>
+              <p>Loggfør bad for å komme på listen!</p>
+         </div>
+      )}
+      <ul className="space-y-4">
+        {leaderboardData.map((userProfile, index) => ( // Bruker userProfile fra leaderboardData
+          <li 
+            key={userProfile.id} 
+            className={`p-4 rounded-lg shadow-md transition-all hover:shadow-xl 
+            ${index === 0 ? 'bg-yellow-300 transform hover:scale-[1.02] ring-2 ring-yellow-400' : index === 1 ? 'bg-slate-200 hover:scale-[1.02]' : index === 2 ? 'bg-orange-200 hover:scale-[1.02]' : 'bg-white hover:scale-[1.02]'}`}
+          >
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center">
+                <span className={`text-xl font-bold mr-3 w-8 text-center ${index < 3 ? 'text-gray-700' : 'text-sky-600'}`}>
+                  {index + 1}.
+                </span>
+                <Avatar 
+                    userProfile={userProfile} // Sender hele profilen
+                    extraClasses="mr-3 cursor-pointer" 
+                    onClick={() => onViewUserProfile(userProfile.id)}
+                    title={`Se ${userProfile.name} sin profil`}
+                />
+                <span 
+                    className={`font-medium hover:underline cursor-pointer ${index < 3 ? 'text-gray-800 text-lg' : 'text-gray-700'}`}
+                    onClick={() => onViewUserProfile(userProfile.id)}
+                    title={`Se ${userProfile.name} sin profil`}
+                >
+                    {userProfile.name}
+                </span>
+              </div>
+              <div className="flex items-center">
+                <span className={`text-xl font-bold ${index < 3 ? 'text-gray-800' : 'text-sky-700'}`}>{userProfile.swims}</span>
+                <Snowflake className={`ml-2 ${index < 3 ? 'text-sky-600' : 'text-sky-500'}`} size={index < 3 ? 24: 20} />
+              </div>
+            </div>
+            <ProgressBar value={userProfile.swims} max={SWIM_GOAL} showLabel={false} barHeight="h-2" />
+            {currentAuthUser && userProfile.id === currentAuthUser.uid && userProfile.swims >= SWIM_GOAL && <p className="text-green-600 font-semibold mt-2 text-sm text-center">🎉 Du har nådd målet! 🎉</p>}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+
+// UserProfilePage (Oppdatert for Firebase data)
+const UserProfilePage = ({ userIdToView, allUserProfiles, swims, plannedSwims, currentAuthUser, onViewUserProfile, onToggleAttend, onDeletePlannedSwim, onToggleReaction, onAddComment, onDeleteSwim, onEditProfile, goBack }) => {
+    
+    const userToViewProfile = allUserProfiles[userIdToView];
+
+    if (!userToViewProfile) {
+      return (
+        <div className="max-w-2xl mx-auto py-6 px-4 text-center text-gray-500">
+          <Loader2 className="animate-spin mx-auto mb-4" size={32}/>
+          Laster brukerprofil...
+        </div>
+      );
+    }
+
+    const userLoggedSwims = swims
+        .filter(s => s.userId === userToViewProfile.id)
+        .sort((a, b) => b.createdAt?.toDate() - a.createdAt?.toDate()); // Sorter etter Firestore timestamp
+
+    const userPlannedSwims = plannedSwims
+        .filter(ps => ps.plannerId === userToViewProfile.id)
+        .sort((a,b) => b.createdAt?.toDate() - a.createdAt?.toDate()); // Sorter etter Firestore timestamp
+
+     const swimCount = swims.filter(s => s.userId === userToViewProfile.id).length; // Beregn antall bad her
+
+
+    return (
+        <div className="max-w-2xl mx-auto py-6 px-4">
+            <button 
+                onClick={goBack}
+                className="mb-6 flex items-center text-sky-600 hover:text-sky-800 transition-colors"
+            >
+                <ArrowLeft size={20} className="mr-2"/> Tilbake
+            </button>
+
+            <div className="bg-white p-6 rounded-xl shadow-lg mb-8">
+                <div className="flex flex-col sm:flex-row items-center">
+                    <Avatar 
+                        userProfile={userToViewProfile} 
+                        sizeClass="w-20 h-20 sm:w-24 sm:h-24 text-4xl sm:text-5xl" 
+                        imageSizeClass="border-4 border-white shadow-md"
+                        extraClasses="mr-0 sm:mr-6 mb-4 sm:mb-0"
+                    />
+                    <div className="text-center sm:text-left">
+                        <h2 className="text-3xl sm:text-4xl font-bold text-sky-700">{userToViewProfile.name}</h2>
+                        <p className="text-gray-600">{swimCount} bad loggført</p>
+                        {currentAuthUser && userToViewProfile.id === currentAuthUser.uid && (
+                            <button 
+                                onClick={onEditProfile}
+                                className="mt-3 bg-slate-200 hover:bg-slate-300 text-slate-700 px-3 py-2 rounded-md text-sm flex items-center mx-auto sm:mx-0"
+                            >
+                                <Edit3 size={16} className="mr-2"/> Rediger profil
+                            </button>
+                        )}
+                    </div>
+                </div>
+                <div className="mt-6">
+                    <ProgressBar value={swimCount} max={SWIM_GOAL} />
+                </div>
+            </div>
+
+            <section>
+                <h3 className="text-2xl font-semibold text-sky-700 mb-4">Loggførte bad</h3>
+                {userLoggedSwims.length === 0 ? (
+                    <p className="text-gray-500">{userToViewProfile.name} har ikke loggført noen bad enda.</p>
+                ) : (
+                    userLoggedSwims.map(swim => (
+                        <SwimCard 
+                            key={swim.id} 
+                            swim={swim} 
+                            allUserProfiles={allUserProfiles} 
+                            currentAuthUser={currentAuthUser}
+                            onToggleReaction={onToggleReaction}
+                            onAddComment={onAddComment}
+                            onDeleteSwim={onDeleteSwim}
+                            onViewUserProfile={onViewUserProfile} 
+                        />
+                    ))
+                )}
+            </section>
+
+            <section className="mt-8">
+                <h3 className="text-2xl font-semibold text-teal-700 mb-4">Planlagte bad (av {userToViewProfile.name})</h3>
+                {userPlannedSwims.length === 0 ? (
+                    <p className="text-gray-500">{userToViewProfile.name} har ikke planlagt noen bad enda.</p>
+                ) : (
+                    userPlannedSwims.map(ps => (
+                        <PlannedSwimFeedCard 
+                            key={ps.id}
+                            plannedSwim={ps}
+                            allUserProfiles={allUserProfiles}
+                            currentAuthUser={currentAuthUser}
+                            onToggleAttend={onToggleAttend}
+                            onDeletePlannedSwim={onDeletePlannedSwim}
+                            onViewUserProfile={onViewUserProfile}
+                        />
+                    ))
+                )}
+            </section>
+        </div>
+    );
+  };
+
+// EditProfileModal (Oppdatert for Firebase)
+const EditProfileModal = ({ isOpen, onClose, currentUserProfile, onUpdateProfile }) => {
+    const [name, setName] = useState('');
+    const [avatarPreview, setAvatarPreview] = useState(null);
+    const [newAvatarFile, setNewAvatarFile] = useState(undefined); // undefined: ikke endret, null: fjernet, File: nytt
+
+    useEffect(() => {
+        if (isOpen && currentUserProfile) {
+            setName(currentUserProfile.name);
+            setAvatarPreview(currentUserProfile.avatarUrl);
+            setNewAvatarFile(undefined); // Reset endringsstatus ved åpning
+        }
+    }, [isOpen, currentUserProfile]);
+
+
+    const handleFileChange = (event) => {
+        const file = event.target.files[0];
+        if (file && file.type.startsWith("image/")) {
+            setNewAvatarFile(file); 
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                setAvatarPreview(reader.result);
+            };
+            reader.readAsDataURL(file);
+        } else {
+            // Tilbakestill hvis ugyldig fil, men behold preview hvis det var et bilde fra før
+            setAvatarPreview(currentUserProfile?.avatarUrl || null); 
+            setNewAvatarFile(undefined); // Ikke endret
+        }
+    };
+
+     const handleRemoveImage = () => {
+        setAvatarPreview(null);
+        setNewAvatarFile(null); // Indikerer at bildet skal fjernes
+        const fileInput = document.getElementById('editAvatarUpload');
+        if(fileInput) fileInput.value = null; // Nullstill inputfeltet
+    };
+
+    const handleSubmit = (e) => {
+        e.preventDefault();
+        if (!name.trim()) {
+            alert("Navn kan ikke være tomt.");
+            return;
+        }
+        // Send med name og newAvatarFile (som kan være File, null eller undefined)
+        onUpdateProfile({ name, newAvatarFile }); 
+    };
+
+    if (!isOpen || !currentUserProfile) return null; 
+
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-[100] p-4 overflow-y-auto">
+            <div className="bg-white p-6 rounded-lg shadow-xl w-full max-w-md transform transition-all my-auto">
+                <h2 className="text-2xl font-semibold mb-6 text-sky-700">Rediger din profil</h2>
+                <form onSubmit={handleSubmit} className="space-y-6">
+                    <div className="flex flex-col items-center space-y-3">
+                        <label htmlFor="editAvatarUpload" className="cursor-pointer">
+                            {avatarPreview ? (
+                                <img src={avatarPreview} alt="Avatar preview" className="w-32 h-32 rounded-full object-cover border-4 border-slate-200 shadow-md" />
+                            ) : (
+                                <div className={`w-32 h-32 rounded-full ${currentUserProfile.avatarColor} flex items-center justify-center text-white font-bold text-5xl border-4 border-slate-200 shadow-md`}>
+                                    {name ? name.substring(0,1) : '?'}
+                                </div>
+                            )}
+                            <div className="mt-2 text-sm text-sky-600 hover:text-sky-800 flex items-center justify-center">
+                                <UploadCloud size={18} className="mr-2"/> Last opp nytt profilbilde
+                            </div>
+                        </label>
+                        <input 
+                            type="file" 
+                            id="editAvatarUpload" 
+                            accept="image/*" 
+                            onChange={handleFileChange}
+                            className="hidden" 
+                        />
+                        {/* Vis "Fjern bilde"-knapp kun hvis det faktisk er et bilde vist */}
+                        {avatarPreview && ( 
+                             <button 
+                                type="button" 
+                                onClick={handleRemoveImage}
+                                className="text-xs text-red-500 hover:text-red-700"
+                            >
+                                Fjern bilde
+                            </button>
+                        )}
+                    </div>
+
+                    <div>
+                        <label htmlFor="profileName" className="block text-sm font-medium text-gray-700">Navn:</label>
+                        <input 
+                            type="text" 
+                            id="profileName" 
+                            value={name} 
+                            onChange={e => setName(e.target.value)} 
+                            required
+                            className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-sky-500 focus:border-sky-500 sm:text-sm"
+                        />
+                    </div>
+                    
+                    <div className="flex justify-end space-x-3 pt-4">
+                        <button 
+                            type="button" 
+                            onClick={onClose}
+                            className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-200 rounded-md hover:bg-gray-300 transition-colors"
+                        >
+                            Avbryt
+                        </button>
+                        <button 
+                            type="submit"
+                            className="px-4 py-2 text-sm font-medium text-white bg-sky-600 rounded-md hover:bg-sky-700 transition-colors flex items-center"
+                        >
+                            <Edit3 size={18} className="mr-2"/> Lagre endringer
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    );
+  };
+
+// PlannedSwimModal (uendret, men bruker onAddPlannedSwim som nå er async)
+const PlannedSwimModal = ({ isOpen, onClose, onAddPlannedSwim }) => {
+    const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
+    const [time, setTime] = useState('12:00');
+    const [location, setLocation] = useState('');
+    const [description, setDescription] = useState('');
+
+    const resetForm = () => {
+        setDate(new Date().toISOString().split('T')[0]);
+        setTime('12:00');
+        setLocation('');
+        setDescription('');
+    };
+
+    const handleSubmit = (e) => {
+      e.preventDefault();
+      if (!location.trim() || !date || !time) {
+        alert("Dato, tid og sted må fylles ut.");
+        return;
+      }
+      onAddPlannedSwim({ date, time, location, description });
+      resetForm(); 
+    };
+
+    if (!isOpen) return null;
+
+    return (
+      <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-[100] p-4">
+        <div className="bg-white p-6 rounded-lg shadow-xl w-full max-w-md transform transition-all">
+          <h2 className="text-2xl font-semibold mb-4 text-sky-700">Planlegg et bad! <CalendarDays className="inline-block ml-2 text-sky-500" /></h2>
+          <form onSubmit={handleSubmit} className="space-y-4">
+             {/* Skjemafelter som før... */}
+              <div>
+              <label htmlFor="plan-date" className="block text-sm font-medium text-gray-700">Dato:</label>
+              <input type="date" id="plan-date" value={date} onChange={e => setDate(e.target.value)} required 
+                     className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-sky-500 focus:border-sky-500 sm:text-sm"/>
+            </div>
+            <div>
+              <label htmlFor="plan-time" className="block text-sm font-medium text-gray-700">Tid:</label>
+              <input type="time" id="plan-time" value={time} onChange={e => setTime(e.target.value)} required 
+                     className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-sky-500 focus:border-sky-500 sm:text-sm"/>
+            </div>
+            <div>
+              <label htmlFor="plan-location" className="block text-sm font-medium text-gray-700">Sted:</label>
+              <input type="text" id="plan-location" value={location} onChange={e => setLocation(e.target.value)} required placeholder="F.eks. Hvervenbukta"
+                     className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-sky-500 focus:border-sky-500 sm:text-sm"/>
+            </div>
+            <div>
+              <label htmlFor="plan-description" className="block text-sm font-medium text-gray-700">Ekstra info (valgfritt):</label>
+              <textarea id="plan-description" value={description} onChange={e => setDescription(e.target.value)} rows="2" placeholder="Ta med kaffe?"
+                        className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-sky-500 focus:border-sky-500 sm:text-sm"></textarea>
+            </div>
+            <div className="flex justify-end space-x-3">
+              <button type="button" onClick={() => { onClose(); resetForm(); }}
+                      className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-200 rounded-md hover:bg-gray-300 transition-colors">
+                Avbryt
+              </button>
+              <button type="submit"
+                      className="px-4 py-2 text-sm font-medium text-white bg-sky-600 rounded-md hover:bg-sky-700 transition-colors flex items-center">
+                <PlusCircle size={18} className="mr-2"/> Planlegg
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    );
+};
+
+
+export default App;
+
